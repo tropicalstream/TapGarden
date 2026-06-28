@@ -10,6 +10,7 @@ import android.location.LocationManager
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
 import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
@@ -39,8 +40,6 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
     private lateinit var viewport: FrameLayout
     private lateinit var keyboardContainer: FrameLayout
     private var keyboardView: CustomKeyboardView? = null
-    private var keyboardBuffer: String = ""
-    private var keyboardCursor: Int = 0
     private val imeSuppressor = Handler(Looper.getMainLooper())
     private var suppressImeUntilMs = 0L
     private val homeUrl = "https://radio.garden"
@@ -100,6 +99,7 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
             logicalClickHandler = { x, y -> handleLogicalClick(x, y) }
             edgePanHandler = { dx, dy -> panRadioGardenMap(dx, dy) }
             edgePanStopHandler = { stopRadioGardenMapPan() }
+            contentInteractionBlocked = { keyboardContainer.visibility == View.VISIBLE }
             addView(viewport, 0)
             setWebViewTarget(webView)
         }
@@ -191,8 +191,8 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
 
     private inner class TgBridge {
         @JavascriptInterface fun onInputFocus(value: String?) = runOnUiThread {
-            keyboardBuffer = value.orEmpty()
-            keyboardCursor = keyboardBuffer.length
+            // Editing now operates directly on the live DOM field, so no native
+            // buffer is kept here (that was the stale-text bug).
             suppressImeFor(1800L)
             showKeyboard()
         }
@@ -314,6 +314,67 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
                 if(el.selectionStart!=null) el.selectionStart=el.selectionEnd=Math.max(0, Math.min(value.length, cursor == null ? value.length : cursor));
                 notify(el);
                 setTimeout(function(){ activeInput(); }, 0);
+              };
+              function caret(el){
+                var s = (typeof el.selectionStart === 'number') ? el.selectionStart : (el.value||'').length;
+                var e = (typeof el.selectionEnd === 'number') ? el.selectionEnd : s;
+                return [s, e];
+              }
+              window.__tgInsert = function(text){
+                var el=activeInput(); if(!el) return;
+                if(el.isContentEditable){
+                  try{ el.focus({preventScroll:true}); }catch(_){ try{el.focus();}catch(__){} }
+                  if(!document.execCommand || !document.execCommand('insertText', false, text)){
+                    el.textContent = (el.textContent||'') + text;
+                  }
+                  el.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:text}));
+                  return;
+                }
+                if(typeof el.value!=='string') return;
+                var c=caret(el), s=c[0], e=c[1], v=el.value;
+                var nv=v.slice(0,s)+text+v.slice(e);
+                setNativeValue(el,nv);
+                var pos=s+text.length;
+                if(typeof el.selectionStart==='number') el.selectionStart=el.selectionEnd=pos;
+                notify(el);
+              };
+              window.__tgBackspace = function(){
+                var el=activeInput(); if(!el) return;
+                if(el.isContentEditable){
+                  try{ el.focus({preventScroll:true}); }catch(_){ try{el.focus();}catch(__){} }
+                  if(!document.execCommand || !document.execCommand('delete', false)){
+                    el.textContent = (el.textContent||'').slice(0,-1);
+                  }
+                  el.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'deleteContentBackward'}));
+                  return;
+                }
+                if(typeof el.value!=='string') return;
+                var c=caret(el), s=c[0], e=c[1], v=el.value, nv, pos;
+                if(s!==e){ nv=v.slice(0,s)+v.slice(e); pos=s; }
+                else if(s>0){ nv=v.slice(0,s-1)+v.slice(s); pos=s-1; }
+                else return;
+                setNativeValue(el,nv);
+                if(typeof el.selectionStart==='number') el.selectionStart=el.selectionEnd=pos;
+                notify(el);
+              };
+              window.__tgClear = function(){
+                var el=activeInput(); if(!el) return;
+                if(el.isContentEditable){
+                  el.textContent='';
+                  el.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'deleteContent'}));
+                  return;
+                }
+                if(typeof el.value!=='string') return;
+                setNativeValue(el,'');
+                if(typeof el.selectionStart==='number') el.selectionStart=el.selectionEnd=0;
+                notify(el);
+              };
+              window.__tgMoveCaret = function(delta){
+                var el=activeInput(); if(!el) return;
+                if(typeof el.selectionStart!=='number') return;
+                var len=(el.value||'').length;
+                var pos=Math.max(0, Math.min(len, el.selectionStart + delta));
+                el.selectionStart=el.selectionEnd=pos;
               };
               window.__tgEnter = function(){
                 var el=activeInput(); if(!el) return;
@@ -454,44 +515,31 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
         webView.evaluateJavascript(expr, null)
     }
 
-    private fun pushKeyboardBuffer() {
-        js("window.__tgSetText && window.__tgSetText(${JSONObject.quote(keyboardBuffer)}, $keyboardCursor)")
-    }
-
     override fun onKeyPressed(key: String) {
-        keyboardBuffer = keyboardBuffer.substring(0, keyboardCursor) +
-            key +
-            keyboardBuffer.substring(keyboardCursor)
-        keyboardCursor += key.length
-        pushKeyboardBuffer()
+        // Edit the field's live value at its real caret (no stale native buffer).
+        Log.d("TapGarden", "keyboard key='${key.replace("\n", "\\n")}'")
+        js("window.__tgInsert && window.__tgInsert(${JSONObject.quote(key)})")
     }
 
     override fun onBackspacePressed() {
-        if (keyboardCursor > 0 && keyboardBuffer.isNotEmpty()) {
-            keyboardBuffer = keyboardBuffer.removeRange(keyboardCursor - 1, keyboardCursor)
-            keyboardCursor -= 1
-            pushKeyboardBuffer()
-        }
+        Log.d("TapGarden", "keyboard backspace")
+        js("window.__tgBackspace && window.__tgBackspace()")
     }
 
     override fun onEnterPressed() {
-        pushKeyboardBuffer()
+        Log.d("TapGarden", "keyboard enter")
         js("window.__tgEnter && window.__tgEnter()")
-        hideKeyboard()
     }
     override fun onHideKeyboard() = hideKeyboard()
     override fun onClearPressed() {
-        keyboardBuffer = ""
-        keyboardCursor = 0
-        pushKeyboardBuffer()
+        Log.d("TapGarden", "keyboard clear")
+        js("window.__tgClear && window.__tgClear()")
     }
     override fun onMoveCursorLeft() {
-        keyboardCursor = (keyboardCursor - 1).coerceAtLeast(0)
-        pushKeyboardBuffer()
+        js("window.__tgMoveCaret && window.__tgMoveCaret(-1)")
     }
     override fun onMoveCursorRight() {
-        keyboardCursor = (keyboardCursor + 1).coerceAtMost(keyboardBuffer.length)
-        pushKeyboardBuffer()
+        js("window.__tgMoveCaret && window.__tgMoveCaret(1)")
     }
     override fun onMicrophonePressed() { /* no voice input in TapGarden */ }
 

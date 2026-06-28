@@ -13,6 +13,7 @@ import android.view.ViewConfiguration
 import android.webkit.WebView
 import android.widget.FrameLayout
 import kotlin.math.abs
+import kotlin.math.hypot
 
 /**
  * Side-by-side binocular compositor (ported from TapLinkX3 / TapInsight).
@@ -36,6 +37,7 @@ class BinocularSbsLayout @JvmOverloads constructor(
     var logicalClickHandler: ((Float, Float) -> Boolean)? = null
     var edgePanHandler: ((Int, Int) -> Unit)? = null
     var edgePanStopHandler: (() -> Unit)? = null
+    var contentInteractionBlocked: (() -> Boolean)? = null
     var menuActionHandler: ((String) -> Unit)? = null
     private var cursorX = 320f
     private var cursorY = 240f
@@ -46,6 +48,10 @@ class BinocularSbsLayout @JvmOverloads constructor(
     private var downInputY = 0f
     private var downCursorX = 0f
     private var downCursorY = 0f
+    private var lastMoveTimeMs = 0L
+    private var preMoveCursorX = 0f
+    private var preMoveCursorY = 0f
+    private var lastMoveDist = 0f
     private var leftVolumeStartY = 0f
     private var leftVolumeStart = 0
     private var draggingPage = false
@@ -173,6 +179,7 @@ class BinocularSbsLayout @JvmOverloads constructor(
                 }
             }
             MotionEvent.ACTION_BUTTON_PRESS -> {
+                if (logicalClickHandler?.invoke(cursorX, cursorY) == true) return true
                 clickAtCursor(event.eventTime)
                 return true
             }
@@ -211,6 +218,8 @@ class BinocularSbsLayout @JvmOverloads constructor(
                 downInputY = rawY
                 downCursorX = cursorX
                 downCursorY = cursorY
+                lastMoveTimeMs = 0L
+                lastMoveDist = 0f
                 if (activeSide == Side.LEFT_VOLUME) {
                     leftVolumeStartY = rawY
                     leftVolumeStart = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
@@ -237,10 +246,18 @@ class BinocularSbsLayout @JvmOverloads constructor(
                 val dx = localX - lastInputX
                 val dy = rawY - lastInputY
                 if (abs(dx) < 0.35f && abs(dy) < 0.35f) return true
+                preMoveCursorX = cursorX
+                preMoveCursorY = cursorY
                 moveCursor(dx, dy, logicalWidth)
+                lastMoveDist = hypot(cursorX - preMoveCursorX, cursorY - preMoveCursorY)
+                lastMoveTimeMs = event.eventTime
                 lastInputX = localX
                 lastInputY = rawY
-                updateEdgeScroll(logicalWidth)
+                if (contentInteractionBlocked?.invoke() == true) {
+                    stopEdgeScroll()
+                } else {
+                    updateEdgeScroll(logicalWidth)
+                }
                 return true
             }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL, MotionEvent.ACTION_HOVER_EXIT,
@@ -248,6 +265,18 @@ class BinocularSbsLayout @JvmOverloads constructor(
                 if (activeSide == Side.LEFT_VOLUME) {
                     activeSide = Side.NONE
                     return true
+                }
+                // Capacitive trackpad liftoff jump: the finger's final sample is
+                // slightly off. If the gesture ends right after a small move, undo
+                // that last micro-move so the cursor stays put on release.
+                if (!draggingPage && activeSide == Side.RIGHT_CURSOR &&
+                    lastMoveTimeMs != 0L &&
+                    event.eventTime - lastMoveTimeMs <= LIFT_JUMP_WINDOW_MS &&
+                    lastMoveDist <= LIFT_JUMP_MAX_PX
+                ) {
+                    cursorX = preMoveCursorX
+                    cursorY = preMoveCursorY
+                    updateCursor()
                 }
                 val moved = abs(localX - downInputX) > touchSlop || abs(rawY - downInputY) > touchSlop
                 if (draggingPage) {
@@ -396,6 +425,8 @@ class BinocularSbsLayout @JvmOverloads constructor(
         private const val EDGE_SCROLL_BAND_PX = 44f
         private const val EDGE_SCROLL_MAX_STEP_PX = 22f
         private const val EDGE_SCROLL_INTERVAL_MS = 33L
+        private const val LIFT_JUMP_WINDOW_MS = 140L
+        private const val LIFT_JUMP_MAX_PX = 48f
     }
 
     override fun onDescendantInvalidated(child: View, target: View) {
