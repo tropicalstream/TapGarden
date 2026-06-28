@@ -3,13 +3,17 @@ package com.tapgarden.app
 import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.location.Location
 import android.location.LocationListener
 import android.location.LocationManager
+import android.net.wifi.WifiManager
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
 import android.util.Log
 import android.view.Gravity
 import android.view.View
@@ -46,6 +50,20 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
     private var pendingGeoOrigin: String? = null
     private var pendingGeoCallback: GeolocationPermissions.Callback? = null
     private var freshLocationListener: LocationListener? = null
+    private val playbackWakeLock: PowerManager.WakeLock by lazy {
+        (getSystemService(Context.POWER_SERVICE) as PowerManager)
+            .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "TapGarden:StreamingAudio").apply {
+                setReferenceCounted(false)
+            }
+    }
+    private val playbackWifiLock: WifiManager.WifiLock? by lazy {
+        (applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager)?.run {
+            @Suppress("DEPRECATION")
+            createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "TapGarden:StreamingAudio").apply {
+                setReferenceCounted(false)
+            }
+        }
+    }
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -53,6 +71,8 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
 
         runCatching { com.ffalcon.mercury.android.sdk.MercurySDK.init(application) }
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        holdPlaybackResources()
+        startPlaybackService()
         window.setSoftInputMode(
             WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN or
                 WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING
@@ -110,6 +130,51 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
         webView.loadUrl(homeUrl)
     }
 
+    private fun holdPlaybackResources() {
+        runCatching {
+            if (!playbackWakeLock.isHeld) playbackWakeLock.acquire()
+        }.onFailure {
+            Log.w("TapGarden", "Unable to acquire playback wake lock: ${it.message}")
+        }
+        runCatching {
+            val lock = playbackWifiLock
+            if (lock != null && !lock.isHeld) lock.acquire()
+        }.onFailure {
+            Log.w("TapGarden", "Unable to acquire playback Wi-Fi lock: ${it.message}")
+        }
+    }
+
+    private fun releasePlaybackResources() {
+        runCatching {
+            if (playbackWifiLock?.isHeld == true) playbackWifiLock?.release()
+        }
+        runCatching {
+            if (playbackWakeLock.isHeld) playbackWakeLock.release()
+        }
+    }
+
+    private fun startPlaybackService() {
+        val intent = Intent(this, TapGardenPlaybackService::class.java)
+        runCatching {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(intent)
+            } else {
+                @Suppress("DEPRECATION")
+                startService(intent)
+            }
+        }.onFailure {
+            Log.w("TapGarden", "Unable to start playback service: ${it.message}")
+        }
+    }
+
+    private fun stopPlaybackService() {
+        runCatching {
+            stopService(Intent(this, TapGardenPlaybackService::class.java))
+        }.onFailure {
+            Log.w("TapGarden", "Unable to stop playback service: ${it.message}")
+        }
+    }
+
     @SuppressLint("SetJavaScriptEnabled")
     private fun configure(wv: WebView) {
         wv.settings.apply {
@@ -117,6 +182,7 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
             domStorageEnabled = true
             @Suppress("DEPRECATION") databaseEnabled = true
             mediaPlaybackRequiresUserGesture = false
+            setOffscreenPreRaster(true)
             setGeolocationEnabled(true)
             loadWithOverviewMode = true
             useWideViewPort = true
@@ -127,6 +193,9 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
             allowFileAccess = false
             setSupportMultipleWindows(false)
             javaScriptCanOpenWindowsAutomatically = false
+        }
+        runCatching {
+            wv.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_BOUND, true)
         }
         disableSystemKeyboard(wv)
         wv.addJavascriptInterface(TgBridge(), "TgBridge")
@@ -159,6 +228,7 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
 
             override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
                 super.onPageStarted(view, url, favicon)
+                injectRadioGardenDarkMode()
                 installGeolocationBridge()
                 injectBestKnownLocation()
             }
@@ -168,6 +238,7 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
                 installGeolocationBridge()
                 injectBestKnownLocation()
                 requestFreshLocation()
+                injectRadioGardenDarkMode()
                 injectAdCleanup()
                 injectRadioGardenHelpers()
                 injectKeyboardSupport()
@@ -557,6 +628,7 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
+        holdPlaybackResources()
         if (hasFocus) enableImmersiveFullscreen()
     }
 
@@ -677,6 +749,54 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
               obs.observe(document.documentElement,{childList:true,subtree:true,attributes:true,attributeFilter:['class','style']});
               window.__tapgardenGlassesLayout={refresh:refresh};
               refresh(); setTimeout(refresh,500); setTimeout(refresh,1500);
+            })();
+        """.trimIndent()
+        runCatching { webView.evaluateJavascript(js, null) }
+    }
+
+    private fun injectRadioGardenDarkMode() {
+        val js = """
+            (function() {
+              if (window.__tapgardenDarkModeBootstrapped) return;
+              window.__tapgardenDarkModeBootstrapped = true;
+              try {
+                ['theme','color-scheme','colorScheme','radio.garden.theme','radiogarden.theme'].forEach(function(key) {
+                  try { localStorage.setItem(key, 'dark'); } catch(e) {}
+                });
+                ['darkMode','isDarkMode','radio.garden.darkMode','radiogarden.darkMode'].forEach(function(key) {
+                  try { localStorage.setItem(key, 'true'); } catch(e) {}
+                });
+              } catch(e) {}
+              try {
+                if (!document.getElementById('tapgarden-dark-mode-default')) {
+                  var style = document.createElement('style');
+                  style.id = 'tapgarden-dark-mode-default';
+                  style.textContent = ':root{color-scheme:dark!important}html,body{background:#07090b!important}';
+                  document.head.appendChild(style);
+                }
+              } catch(e) {}
+              try {
+                var nativeMatchMedia = window.matchMedia && window.matchMedia.bind(window);
+                if (nativeMatchMedia && !window.__tapgardenNativeMatchMedia) {
+                  window.__tapgardenNativeMatchMedia = nativeMatchMedia;
+                  window.matchMedia = function(query) {
+                    if (String(query).indexOf('prefers-color-scheme') >= 0) {
+                      var isDark = String(query).indexOf('dark') >= 0;
+                      return {
+                        matches: isDark,
+                        media: query,
+                        onchange: null,
+                        addListener: function(){},
+                        removeListener: function(){},
+                        addEventListener: function(){},
+                        removeEventListener: function(){},
+                        dispatchEvent: function(){ return false; }
+                      };
+                    }
+                    return window.__tapgardenNativeMatchMedia(query);
+                  };
+                }
+              } catch(e) {}
             })();
         """.trimIndent()
         runCatching { webView.evaluateJavascript(js, null) }
@@ -868,6 +988,8 @@ class MainActivity : android.app.Activity(), CustomKeyboardView.OnKeyboardAction
             }
         }
         freshLocationListener = null
+        releasePlaybackResources()
+        stopPlaybackService()
         runCatching { webView.destroy() }
         super.onDestroy()
     }
